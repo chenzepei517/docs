@@ -1,237 +1,237 @@
-# 消息队列开发指南
+# Message Queue Development Guide
 
-\[ [English](../../../../en/device_dev_guide/kernel/IPC/message_queue.md) | 简体中文 \]
+\[ English | [简体中文](../../../../zh-cn/device_dev_guide/kernel/IPC/message_queue.md) \]
 
 
-## 一、概述
+## I. Overview
 
-本文档为您介绍如何在 openvela 操作系统中使用 POSIX (Portable Operating System Interface) 消息队列。消息队列是实现任务间可靠、异步通信的关键机制。
+This document introduces how to use POSIX (Portable Operating System Interface) message queues in the openvela operating system. Message queues are a key mechanism for implementing reliable, asynchronous communication between tasks.
 
-openvela OS 遵循 **POSIX** 标准，提供了一套完整的消息队列 API，允许任何任务（Task）或中断服务程序（ISR）安全地发送和接收数据。此标准化的接口确保了代码的良好可移植性。
+openvela OS adheres to the **POSIX** standard and provides a complete set of message queue APIs, allowing any task or interrupt service routine (ISR) to safely send and receive data. This standardized interface ensures good portability of the code.
 
-核心特性
+Core features:
 
-- **命名队列**： 消息队列通过全局唯一的名称进行标识，允许多个不相关的任务访问同一个队列。
-- **优先级消息**： 任务可以为发送的消息指定优先级，高优先级的消息会优先被接收。
-- **阻塞与非阻塞操作**： API 支持阻塞、非阻塞和超时三种模式，为不同应用场景提供灵活的同步策略。
-- **中断安全**： 您可以在中断服务程序中安全地发送消息。
+- **Named Queues**: Message queues are identified by a globally unique name, allowing multiple unrelated tasks to access the same queue.
+- **Priority Messages**: Tasks can specify priorities for sent messages, and higher-priority messages are received first.
+- **Blocking and Non-Blocking Operations**: The API supports three modes: blocking, non-blocking, and timeout, providing flexible synchronization strategies for different application scenarios.
+- **Interrupt Safety**: You can safely send messages in interrupt service routines.
 
-## 二、前置概念
+## II. Pre-requisite Concepts
 
-在源码中，频繁出现几组用于同步和互斥的底层宏/函数，理解它们对于深入分析内核行为至关重要。
+In the source code, several groups of low-level macros/functions for synchronization and mutual exclusion frequently appear. Understanding them is crucial for in-depth analysis of kernel behavior.
 
 #### `enter_critical_section/leave_critical_section`
 
-这两个函数用于创建**临界区**，是系统中最强级别的锁。
+These two functions are used to create a **critical section** and are the strongest level of locks in the system.
 
-- **作用**：在单核系统中，它通过**关闭中断**来实现。在多核系统中，它还会结合自旋锁（Spinlock）使用。
-- **目的**：保护的不仅仅是多任务间的共享数据，更重要的是保护了任务与中断服务程序 (ISR) 之间的共享数据。因为 `mq_send` 可以在中断中被调用，所以对消息链表、计数值等核心数据的修改，必须在完全禁止并发（包括中断）的环境下进行。
-- **使用原则**：临界区应尽可能短，因为关中断会增加系统的中断延迟。
+- **Function**: In a single-core system, it is implemented by **disabling interrupts**. In a multi-core system, it is used in conjunction with a spinlock.
+- **Purpose**: It protects not only shared data between multiple tasks but, more importantly, shared data between tasks and interrupt service routines (ISRs). Since `mq_send` can be called in an interrupt, modifications to core data such as message linked lists and count values must be performed in an environment where concurrency (including interrupts) is completely prohibited.
+- **Usage Principle**: The critical section should be as short as possible because disabling interrupts increases the system's interrupt latency.
 
 #### `sched_lock/sched_unlock`
 
-这对函数用于锁定/解锁**调度器**。
+This pair of functions is used to lock/unlock the **scheduler**.
 
-- **作用**：禁止任务的上下文切换，即禁止任务抢占。
-- **与临界区的区别**：它不关闭中断。在调度器被锁住期间，中断仍然可以正常发生和处理，只是中断处理完毕后，系统不会进行任务切换，会继续运行被锁定的任务。
-- **目的**：用于保护一段逻辑的原子性，确保它在执行期间不会因为被更高优先级的任务抢占而中断。它的开销比开关中断要小。
+- **Function**: Prohibits task context switching, i.e., prohibits task preemption.
+- **Difference from Critical Section**: It does not disable interrupts. When the scheduler is locked, interrupts can still occur and be processed normally, but after interrupt handling, the system will not perform task switching and will continue to run the locked task.
+- **Purpose**: Used to protect the atomicity of a segment of logic, ensuring that it will not be interrupted by being preempted by a higher-priority task during execution. Its overhead is smaller than switching interrupts on and off.
 
 #### `enter_cancellation_point/leave_cancellation_point`
 
-这对函数与 POSIX 的线程取消 (Thread Cancellation) 机制相关。
+This pair of functions is related to the POSIX thread cancellation mechanism.
 
-- 作用：定义一个取消点。根据 POSIX 标准，像 `mq_receive`, `read`, `sleep` 等可能永久阻塞的函数都必须是取消点。
-- 目的：当一个任务（线程）被其他任务请求取消时（例如通过 `pthread_cancel`），它并不会立即终止，而是会继续运行直到抵达下一个取消点。在取消点，系统会检查该任务是否有待处理的取消请求，如果有，则执行取消操作，使任务退出。这确保了任务可以在一个安全、已知的状态下被终止。
+- **Function**: Defines a cancellation point. According to the POSIX standard, functions that may block permanently, such as `mq_receive`, `read`, and `sleep`, must all be cancellation points.
+- **Purpose**: When a task (thread) is requested to be canceled by another task (e.g., via `pthread_cancel`), it does not terminate immediately but continues to run until it reaches the next cancellation point. At the cancellation point, the system checks whether the task has a pending cancellation request. If so, it performs the cancellation operation to make the task exit. This ensures that the task can be terminated in a safe and known state.
 
-## 三、前提条件
+## III. Prerequisites
 
-在开始开发前，请在您的代码中包含头文件：
+Before starting development, include the header file in your code:
 
-```C++
+```c
 #include <mqueue.h>
 ```
 
-## 四、API 参考
+## IV. API Reference
 
-我们将 API 按其在消息队列生命周期中的作用进行分类：**生命周期管理**、**数据传输**、**属性与通知**。
+We classify the APIs based on their roles in the message queue lifecycle: **lifecycle management**, **data transmission**, and **attributes and notifications**.
 
-### 生命周期管理
+### Lifecycle Management
 
-管理消息队列的创建、打开、关闭和删除。
+Manages the creation, opening, closing, and deletion of message queues.
 
-#### `mq_open()` - 创建或打开消息队列 
+#### `mq_open()` - Create or Open a Message Queue
 
-此函数打开一个已存在的消息队列，或根据 `oflags` 参数创建一个新的队列。成功调用后，它返回一个消息队列描述符 (`mqd_t`)，供后续函数使用。
+This function opens an existing message queue or creates a new queue based on the `oflags` parameter. Upon successful invocation, it returns a message queue descriptor (`mqd_t`) for use in subsequent functions.
 
-```C
+```c
 mqd_t mq_open(FAR const char *mq_name, int oflags, ...)
 ```
 
-**参数**
+**Parameters**
 
-| 参数    | 描述                                         |
-| ------- | -------------------------------------------- |
-| mq_name | 指向消息队列名称的字符串，例如 "/my_queue"。 |
-| oflags  | 操作标志位，可使用按位或（\|）组合。         |
+| Parameter | Description                                                                 |
+| --------- | --------------------------------------------------------------------------- |
+| mq_name   | Pointer to the message queue name string, e.g., "/my_queue".                |
+| oflags    | Operation flag bits, which can be combined using bitwise OR (&#124;).        |
 
-`oflags` 的常用值包括：
+Common values for `oflags` include:
 
-- 访问模式（三选一）：
-  - `O_RDONLY`：以只读方式打开。
-  - `O_WRONLY`：以只写方式打开。
-  - `O_RDWR`：以读写方式打开。
-- 创建标志（可选）：
-  - `O_CREAT`：如果队列不存在，则创建它。
-    - 使用此标志时，`mq_open` 需要两个额外参数：`mode_t mode` 和 `struct mq_attr *attr`。
-  - `O_EXCL`：与 `O_CREAT` 配合使用，如果队列已存在，则调用失败。
-  - `O_NONBLOCK`：以非阻塞模式打开。影响后续的 `mq_send()` 和 `mq_receive()` 调用。
+- Access modes (choose one):
+  - `O_RDONLY`: Open for reading only.
+  - `O_WRONLY`: Open for writing only.
+  - `O_RDWR`: Open for reading and writing.
+- Creation flags (optional):
+  - `O_CREAT`: Create the queue if it does not exist.
+    - When using this flag, `mq_open` requires two additional parameters: `mode_t mode` and `struct mq_attr *attr`.
+  - `O_EXCL`: Used in conjunction with `O_CREAT`; if the queue already exists, the call fails.
+  - `O_NONBLOCK`: Open in non-blocking mode, affecting subsequent `mq_send()` and `mq_receive()` calls.
 
-#### `mq_close()` - 关闭消息队列
+#### `mq_close()` - Close a Message Queue
 
-此函数断开调用任务与指定消息队列之间的连接。
+This function disconnects the calling task from the specified message queue.
 
-```C
+```c
 int mq_close(mqd_t mqdes)
 ```
 
-**注意事项**
+**Notes**:
 
-- 调用 `mq_close()` 并不会销毁消息队列本身，仅释放当前任务持有的描述符。
-- 其他任务仍可通过 `mq_open()` 访问该队列。
+- Calling `mq_close()` does not destroy the message queue itself but only releases the descriptor held by the current task.
+- Other tasks can still access the queue via `mq_open()`.
 
-#### `mq_unlink()` - 删除消息队列
+#### `mq_unlink()` - Delete a Message Queue
 
-此函数从系统中删除一个消息队列。
+This function removes a message queue from the system.
 
-```C
+```c
 int mq_unlink(FAR const char *mq_name)
 ```
 
-该接口会删除名字为 `mq_name` 的消息队列。当有一个或多个 Task 打开一个消息队列，此时调用 `mq_unlink`，需要等到所有引用该消息队列的 Task 都执行关闭操作后，才会删除消息队列。 
+This interface deletes the message queue named `mq_name`. When one or more tasks have a message queue open, calling `mq_unlink` will wait until all tasks referencing the message queue have performed the close operation before deleting the message queue.
 
-**注意事项**
+**Notes**:
 
-- 如果调用 `mq_unlink()` 时仍有任务打开了该队列，系统会将队列标记为“待删除”状态。
-- 系统会等待所有引用该队列的任务都调用 `mq_close()` 后，才真正释放队列资源。
+- If `mq_unlink()` is called while tasks still have the queue open, the system marks the queue as "to be deleted".
+- The system will wait until all tasks referencing the queue have called `mq_close()` before truly releasing the queue resources.
 
-### 数据传输
+### Data Transmission
 
-负责在任务间发送和接收消息。
+Responsible for sending and receiving messages between tasks.
 
-#### `mq_send()` / `mq_timedsend()` - 发送消息
+#### `mq_send()` / `mq_timedsend()` - Send a Message
 
-```C
+```c
 int mq_send(mqd_t mqdes, const void *msg, size_t msglen, int prio)
 int mq_timedsend(mqd_t mqdes, const char *msg, size_t msglen, int prio,
                  const struct timespec *abstime);
 ```
 
-行为特性
+Behavioral characteristics:
 
-- 队列已满：
-  - 如果队列已满且未设置 `O_NONBLOCK`：
-    - `mq_send()` 会永久阻塞，直到队列有可用空间。
-    - `mq_timedsend()` 会阻塞，直到 `abstime` 指定的绝对时间超时。
-  - 如果设置了 `O_NONBLOCK`，函数会立即返回错误，而不会阻塞。
-- 消息长度： `msglen` 不能超过队列属性中定义的最大消息长度 (`mq_msgsize`)。
+- Queue is full:
+  - If the queue is full and `O_NONBLOCK` is not set:
+    - `mq_send()` will block indefinitely until space is available in the queue.
+    - `mq_timedsend()` will block until the absolute time specified by `abstime` times out.
+  - If `O_NONBLOCK` is set, the function returns an error immediately without blocking.
+- Message length: `msglen` must not exceed the maximum message length (`mq_msgsize`) defined in the queue attributes.
 
-#### `mq_receive()` / `mq_timedreceive()`接收消息
+#### `mq_receive()` / `mq_timedreceive()` - Receive a Message
 
-这两个函数从指定队列中移除并返回优先级最高、等待时间最长的消息。
+These two functions remove and return the highest-priority, longest-waiting message from the specified queue.
 
-```C
+```c
 ssize_t mq_receive(mqd_t mqdes, void *msg, size_t msglen, int *prio);
 ssize_t mq_timedreceive(mqd_t mqdes, void *msg, size_t msglen,
                         int *prio, const struct timespec *abstime);
 ```
 
-行为特性
+Behavioral characteristics:
 
-- 队列为空：
-  - 如果队列为空且未设置 `O_NONBLOCK`：
-    - `mq_receive()` 会永久阻塞，直到有新消息到达。
-    - `mq_timedreceive()` 会阻塞，直到 `abstime` 指定的绝对时间超时。
-  - 如果设置了 `O_NONBLOCK`，函数会立即返回错误。
-- 多任务等待： 如果有多个任务在等待同一个空队列，当新消息到达时，系统会唤醒等待时间最长且优先级最高的那个任务。
-- 缓冲区大小： `msglen` 必须大于或等于队列的最大消息长度 (`mq_msgsize`)。
+- Queue is empty:
+  - If the queue is empty and `O_NONBLOCK` is not set:
+    - `mq_receive()` will block indefinitely until a new message arrives.
+    - `mq_timedreceive()` will block until the absolute time specified by `abstime` times out.
+  - If `O_NONBLOCK` is set, the function returns an error immediately.
+- Multiple tasks waiting: If multiple tasks are waiting for the same empty queue, when a new message arrives, the system wakes up the task that has been waiting the longest and has the highest priority.
+- Buffer size: `msglen` must be greater than or equal to the queue's maximum message length (`mq_msgsize`).
 
-### 属性与通知
+### Attributes and Notifications
 
-用于查询和配置消息队列的高级功能。
+Used to query and configure advanced features of message queues.
 
-#### `mq_getattr()` / `mq_setattr()` - 获取与设置队列属性
+#### `mq_getattr()` / `mq_setattr()` - Get and Set Queue Attributes
 
-这两个函数分别用于查询和修改消息队列的属性。
+These two functions are used to query and modify the attributes of a message queue, respectively.
 
-```C
+```c
 int mq_getattr(mqd_t mqdes, FAR struct mq_attr *mq_stat);
 int mq_setattr(mqd_t mqdes, FAR const struct mq_attr *mq_stat,
                FAR struct mq_attr *oldstat);
 ```
 
-`struct mq_attr` 结构体包含：
+The `struct mq_attr` structure includes:
 
-| 成员       | 描述                                           |
-| ---------- | ---------------------------------------------- |
-| mq_flags   | 队列的标志（例如 O_NONBLOCK）。                |
-| mq_maxmsg  | 队列可容纳的最大消息数。                       |
-| mq_msgsize | 每条消息的最大字节数。                         |
-| mq_curmsgs | 队列中当前的消息数（仅 mq_getattr() 可获取）。 |
+| Member       | Description                                         |
+| ------------ | --------------------------------------------------- |
+| mq_flags     | Queue flags (e.g., O_NONBLOCK).                    |
+| mq_maxmsg    | Maximum number of messages the queue can hold.      |
+| mq_msgsize   | Maximum number of bytes per message.                |
+| mq_curmsgs   | Current number of messages in the queue (only obtainable via mq_getattr()). |
 
-#### `mq_notify()` - 注册异步通知
+#### `mq_notify()` - Register Asynchronous Notification
 
-此函数为消息队列注册一个异步事件通知。当一个空队列接收到第一条消息时，系统会向注册的任务发送一个信号。
+This function registers an asynchronous event notification for a message queue. When an empty queue receives its first message, the system sends a signal to the registered task.
 
-```C
+```c
 int mq_notify(mqd_t mqdes, const struct sigevent *notification);
 ```
 
-工作机制
+Working mechanism:
 
-1. 当输入参数 `notification` 非 `NULL` 时，`mq_notify` 会在当前任务与消息队列建立通知关联。
-2. 当一个空队列变为非空时，系统会向该任务发送 `notification` 中定义的信号。
-3. 一次性通知： 发送信号后，该注册关系会自动解除。您必须重新调用 `mq_notify()` 才能接收下一次通知。
-4. 当 `notification` 为 `NULL` 时，函数会移除已存在的通知关联。
+1. When the input parameter `notification` is non-`NULL`, `mq_notify` establishes a notification association between the current task and the message queue.
+2. When an empty queue becomes non-empty, the system sends the signal defined in `notification` to the task.
+3. One-time notification: After sending the signal, the registration relationship is automatically解除 (解除). You must call `mq_notify()` again to receive the next notification.
+4. When `notification` is `NULL`, the function removes the existing notification association.
 
-**注意事项**
+**Note**:
 
-- 在任何时刻，只有一个任务可以成功注册对某个消息队列的通知。
+- At any given time, only one task can successfully register for notifications of a particular message queue.
 
-## 五、数据结构
+## V. Data Structures
 
-为了深入理解消息队列的工作机制，本节将介绍其在 openvela OS 内部的实现方式，包括核心数据结构和内存管理策略。
+To gain an in-depth understanding of the message queue's working mechanism, this section introduces its internal implementation in openvela OS, including core data structures and memory management strategies.
 
-openvela OS 在架构上将每个 POSIX 消息队列实现为一个伪文件系统（Pseudo-filesystem）的 inode 节点。这种设计统一了内核资源模型，使得消息队列可以像文件一样被命名和访问。
+openvela OS implements each POSIX message queue as an inode node of a pseudo-file system in its architecture. This design unifies the kernel resource model, allowing message queues to be named and accessed like files.
 
-其核心实现包含两大关键部分：**消息内存池**和**核心数据结构**。
+Its core implementation includes two key components: the **message memory pool** and **core data structures**.
 
-### 消息内存池管理
+### Message Memory Pool Management
 
-为保证实时性和内存使用的确定性，openvela OS 采用预分配的内存池来管理消息实体。系统在启动时会创建两个专用的全局消息池。
+To ensure real-time performance and deterministic memory usage, openvela OS uses a pre-allocated memory pool to manage message entities. The system creates two dedicated global message pools at startup.
 
-- `g_msgfree`: 通用消息池。为普通任务（Task）提供消息存储空间。
-  - 分配策略：当任务发送消息时，系统首先尝试从该池中获取一个预分配的消息块。
-  - 动态扩展：如果该池耗尽，系统会尝试通过 `malloc()` 动态分配内存来创建新的消息块，并标记为 `MQ_ALLOC_DYN`。
-  - 释放：消息被接收后，预分配的消息块会归还到 `g_msgfree` 池；动态分配的消息块则通过 `free()` 释放，防止内存泄漏。
-- `g_msgfreeirq`: 中断专用消息池。专供中断服务程序（ISR）使用。
-  - 分配策略：当中断服务程序发送消息时，系统从该池中获取消息块。
-  - 无动态分配：为保证中断处理的快速和确定性，如果该池耗尽，系统将直接返回失败，绝不进行动态内存分配。
-  - 释放：消息被接收后，消息块会归还到 `g_msgfreeirq` 池。
+- `g_msgfree`: General message pool, providing message storage space for ordinary tasks (Tasks).
+  - Allocation strategy: When a task sends a message, the system first attempts to obtain a pre-allocated message block from this pool.
+  - Dynamic expansion: If this pool is exhausted, the system will attempt to dynamically allocate memory via `malloc()` to create new message blocks and mark them as `MQ_ALLOC_DYN`.
+  - Release: After a message is received, pre-allocated message blocks are returned to the `g_msgfree` pool; dynamically allocated message blocks are released via `free()` to prevent memory leaks.
+- `g_msgfreeirq`: Interrupt-dedicated message pool, exclusively for interrupt service routines (ISRs).
+  - Allocation strategy: When an interrupt service routine sends a message, the system obtains a message block from this pool.
+  - No dynamic allocation: To ensure fast and deterministic interrupt handling, if this pool is exhausted, the system will directly return failure and never perform dynamic memory allocation.
+  - Release: After a message is received, the message block is returned to the `g_msgfreeirq` pool.
 
-这种分离设计确保了即使在通用消息池耗尽或内存碎片化的情况下，中断服务中的关键通信依然能够可靠执行。
+This separate design ensures that even if the general message pool is exhausted or memory is fragmented, critical communication in interrupt services can still be executed reliably.
 
-### 核心数据结构
+### Core Data Structures
 
-消息队列的功能由两个核心结构体协同实现：
+The functionality of the message queue is implemented by two core structures:
 
-- `struct mqueue_inode_s` 定义了队列本身。
-- `struct mqueue_msg_s` 定义了在队列中传递的消息。
+- `struct mqueue_inode_s` defines the queue itself.
+- `struct mqueue_msg_s` defines the messages passed in the queue.
 
-#### 消息队列定义
+#### Message Queue Definition
 
-`mqueue_inode_s` 代表一个完整的消息队列实例，包含了其所有属性和状态。
+`mqueue_inode_s` represents a complete message queue instance, including all its attributes and status.
 
-```C
+```c
 /* Common prologue of all message queue structures. */
 
 struct mqueue_cmn_s
@@ -265,18 +265,18 @@ struct mqueue_inode_s
 };
 ```
 
-**关键成员解析：**
+**Key member analysis**:
 
-| 成员          | 描述                                                      |
-| ------------- | --------------------------------------------------------- |
-| msglist       | 一个按优先级排序的链表，用于存储所有待处理的消息。        |
-| ntpid/ntevent | 用于实现 mq_notify() 功能，记录哪个任务正在等待异步通知。 |
+| Member       | Description                                                                 |
+| ------------ | --------------------------------------------------------------------------- |
+| msglist      | A priority-sorted linked list for storing all pending messages.             |
+| ntpid/ntevent | Used to implement the mq_notify() function, recording which task is waiting for asynchronous notification. |
 
-#### 消息实体
+#### Message Entity
 
-`mqueue_msg_s` 代表一条独立的消息，它作为链表节点存在于 `mqueue_inode_s` 的 `msglist` 中。
+`mqueue_msg_s` represents an independent message, which exists as a linked list node in the `msglist` of `mqueue_inode_s`.
 
-```C
+```c
 enum mqalloc_e
 {
   MQ_ALLOC_FIXED = 0,  /* pre-allocated; never freed */
@@ -299,19 +299,19 @@ struct mqueue_msg_s
 };
 ```
 
-关键成员解析：
+Key member analysis:
 
-| 成员     | 描述                                                                   |
-| -------- | ---------------------------------------------------------------------- |
-| type     | 标记该消息块的来源，决定其被接收后是归还到内存池还是通过 free() 释放。 |
-| priority | mq_send 时指定，用于将消息插入到队列的正确位置。                       |
-| mail     | 消息的实际载荷，其实际大小在分配时确定。                               |
+| Member    | Description                                                                 |
+| --------- | --------------------------------------------------------------------------- |
+| type      | Marks the source of the message block, determining whether it is returned to the memory pool or freed via free() after being received. |
+| priority  | Specified in mq_send, used to insert the message into the correct position in the queue. |
+| mail      | The actual payload of the message, whose actual size is determined at the time of allocation. |
 
-#### 系统初始化
+#### System Initialization
 
-openvela OS 在系统启动过程的 `nx_start()` 函数中调用 `nxmq_initialize()` 来完成消息队列子系统的初始化。
+openvela OS calls `nxmq_initialize()` in the `nx_start()` function during system startup to complete the initialization of the message queue subsystem.
 
-```C
+```c
 /****************************************************************************
  * Name: nxmq_initialize
  *
@@ -360,59 +360,57 @@ void nxmq_initialize(void)
 }
 ```
 
-此函数的主要职责是：
+The main responsibilities of this function are:
 
-1. 初始化 `g_msgfree` 和 `g_msgfreeirq` 两个链表头。
-2. 调用 `mq_msgblockinit()` 从系统预留的内存区域 (`g_msgpool`) 中切分出指定数量的消息块，并分别链接到上述两个池中，完成预分配。
+1. Initialize the linked list headers of `g_msgfree` and `g_msgfreeirq`.
+2. Call `mq_msgblockinit()` to split a specified number of message blocks from the system-reserved memory area (`g_msgpool`) and link them to the above two pools, respectively, to complete preallocation.
 
-至此，消息队列子系统准备就绪，可以响应来自任务和中断的 API 调用。
+At this point, the message queue subsystem is ready and can respond to API calls from tasks and interrupts.
 
-## 六、实现原理
+## VI. Implementation Principles
 
-本节将深入探讨 openvela OS 消息队列的内部工作流。其设计的精髓在于将消息队列抽象为虚拟文件系统（VFS）中的一个 `inode` 节点，从而复用文件系统的命名、查找和权限管理机制。
+This section delves into the internal workflow of openvela OS message queues. The essence of the design lies in abstracting the message queue as an `inode` node in the virtual file system (VFS), thereby reusing the file system's naming, lookup, and permission management mechanisms.
 
 <img src="./figures/003.png" alt="message_queue" width="75%">
 
-整个生命周期的核心流程可以概括如下：
+The core process of the entire lifecycle can be summarized as follows:
 
-- **创建/打开 (****`mq_open`****)**: 任务通过一个唯一的名称来访问消息队列。系统会在 VFS 中查找或创建一个对应的 `inode`，并将其与一个新分配的 `mqueue_inode_s` 结构体关联起来。
-- **发送/接收 (****`mq_send`****/****`mq_receive`****)**: 数据传输的核心是 `mqueue_msg_s` 结构体，它像一个集装箱。发送时，系统从全局内存池（`g_msgfree` 或 `g_msgfreeirq`）取出一个集装箱，装载数据后，挂入目标队列的 `msglist`。接收时则反之。
-- **关闭/删除 (****`mq_close`****/****`mq_unlink`****)**: `mq_close` 会递减 `inode` 的引用计数。当计数归零时，`mq_unlink` 才能真正释放 `inode` 和 `mqueue_inode_s` 占用的资源。
+- **Creation/Opening (****`mq_open`****)**: Tasks access message queues via a unique name. The system looks up or creates a corresponding `inode` in the VFS and associates it with a newly allocated `mqueue_inode_s` structure.
+- **Sending/Receiving (****`mq_send`****/****`mq_receive`****)**: The core of data transmission is the `mqueue_msg_s` structure, which acts like a container. When sending, the system retrieves a container from the global memory pool (`g_msgfree` or `g_msgfreeirq`), loads the data, and hangs it into the target queue's `msglist`. The reverse occurs when receiving.
+- **Closing/Deleting (****`mq_close`****/****`mq_unlink`****)**: `mq_close` decrements the `inode` reference count. When the count reaches zero, `mq_unlink` can truly release the resources occupied by `inode` and `mqueue_inode_s`.
 
-下面，我们以关键 API 为线索，解析其详细实现。
+Below, we analyze the detailed implementation using key APIs as clues.
 
-### `mq_open`: 队列的创建与连接
+### `mq_open`: Queue Creation and Connection
 
-`mq_open` 是所有操作的入口，它负责将一个字符串名称解析并关联到一个内核消息队列对象。
+`mq_open` is the entry point for all operations, responsible for parsing a string name and associating it with a kernel message queue object.
 
-`mq_open`函数会完成以下任务： 
+The `mq_open` function performs the following tasks:
 
-其内部实现逻辑（主要在 `file_mq_vopen` 函数中）可以分解为以下步骤：
+Its internal implementation logic (mainly in the `file_mq_vopen` function) can be broken down into the following steps:
 
-1. 路径解析：将用户提供的 `mq_name`（如 `"my_queue"`）与系统预设的挂载点路径（`CONFIG_FS_MQUEUE_VFS_PATH`，通常是 `"/var/mqueue"`）拼接成一个完整的 VFS 路径，例如 `"/var/mqueue/my_queue"`。
-2. 原子化查找：进入临界区（`enter_critical_section`）以保证操作的原子性，然后调用 `inode_find()` 在 VFS 中查找该路径对应的 `inode`。
-3. 分支处理：
+1. Path resolution: Concatenate the user-provided `mq_name` (e.g., `"my_queue"`) with the system's preset mount point path (`CONFIG_FS_MQUEUE_VFS_PATH`, typically `"/var/mqueue"`) to form a complete VFS path, such as `"/var/mqueue/my_queue"`.
+2. Atomic lookup: Enter a critical section (`enter_critical_section`) to ensure atomicity of the operation, then call `inode_find()` to look up the path in the VFS for the corresponding `inode`.
+3. Branch processing:
 
-    - 情况 A：消息队列已存在 (`inode_find` 成功)
+    - Case A: The message queue already exists (`inode_find` is successful)
+        - Check that the found `inode` is indeed a message queue type.
+        - If the caller specifies both `O_CREAT` and `O_EXCL` flags, return an `EEXIST` error.
+        - Success, associate the returned file descriptor with this existing `inode`. Increment the `inode` reference count by one.
 
-        - 检查找到的 `inode` 确实是一个消息队列类型。
-        - 如果调用者同时指定了 `O_CREAT` 和 `O_EXCL` 标志，则返回 `EEXIST` 错误。
-        - 成功，将返回的文件描述符与这个已存在的 `inode` 关联。`inode` 的引用计数加一。
-
-    - 情况 B：消息队列不存在 (`inode_find` 失败)
-        - 检查调用者是否指定了 `O_CREAT` 标志，若未指定，则返回 `ENOENT` 错误。
-        - 调用 `inode_reserve()` 在 VFS 中为新队列创建一个 `inode` 节点。
-        - 调用 `nxmq_alloc_msgq()` 分配并初始化一个 `mqueue_inode_s` 结构体。
-        - 将新创建的 `inode` 与 `mqueue_inode_s` 进行绑定：
-
+    - Case B: The message queue does not exist (`inode_find` fails)
+        - Check if the caller specified the `O_CREAT` flag; if not, return an `ENOENT` error.
+        - Call `inode_reserve()` to create an `inode` node for the new queue in the VFS.
+        - Call `nxmq_alloc_msgq()` to allocate and initialize an `mqueue_inode_s` structure.
+        - Bind the newly created `inode` to the `mqueue_inode_s`:
             - `inode->i_private = msgq;`
             - `msgq->inode = inode;`
 
-        - 设置 `inode` 的初始引用计数为 1。
+        - Set the initial reference count of the `inode` to 1.
 
-关键代码如下：
+Key code is as follows:
 
-```C
+```c
 static int file_mq_vopen(FAR struct file *mq, FAR const char *mq_name,
                          int oflags, mode_t umask, va_list ap,
                          FAR int *created)
@@ -602,11 +600,11 @@ errout:
 }
 ```
 
-#### `nxmq_alloc_msgq()`: 消息队列实例的分配
+#### `nxmq_alloc_msgq()`: Allocation of Message Queue Instances
 
-此函数负责创建消息队列的核心数据结构 `mqueue_inode_s`。它的实现相对简单直接：
+This function is responsible for creating the core data structure `mqueue_inode_s` of the message queue. Its implementation is relatively simple and straightforward:
 
-```C
+```c
 int nxmq_alloc_msgq(FAR struct mq_attr *attr,
                     FAR struct mqueue_inode_s **pmsgq)
 {
@@ -660,42 +658,40 @@ int nxmq_alloc_msgq(FAR struct mq_attr *attr,
 } 
 ```
 
-通过这一系列操作，`mq_open` 巧妙地将 POSIX 消息队列无缝集成到了系统的 VFS 框架中，为后续的数据收发奠定了基础。
+Through this series of operations, `mq_open` skillfully integrates POSIX message queues into the system's VFS framework, laying the foundation for subsequent data sending and receiving.
 
-### `mq_send`: 消息的发送与阻塞
+### `mq_send`: Message Sending and Blocking
 
-`mq_send` 负责将一条带优先级的消息投递到目标队列。其实现的核心是处理队列已满时的不同策略：立即返回、阻塞等待或超时返回。
+`mq_send` is responsible for delivering a prioritized message to the target queue. The core of its implementation is handling different strategies when the queue is full: return immediately, block and wait, or return on timeout.
 
-其主要逻辑由内部函数 `file_mq_timedsend_internal` 实现，流程可分为以下两大场景：
+Its main logic is implemented by the internal function `file_mq_timedsend_internal`, and the process can be divided into the following two scenarios:
 
-##### 场景 A: 队列未满
+##### Scenario A: Queue is Not Full
 
-1. **消息预分配**：在进入临界区之前，系统首先调用 `nxmq_alloc_msg()` 从全局内存池申请一个 `mqueue_msg_s` 结构体，并用 `memcpy` 将用户数据和优先级填充进去。这种预处理方式减少了在临界区内的工作，提高了效率。
-2. **进入临界区**：调用 `enter_critical_section()`，确保对队列状态的修改是原子的。
-3. **插入消息**：调用 `nxmq_add_queue()`，该函数会根据消息的优先级，将其插入到 `msgq->msglist` 链表的正确位置。这是一个按优先级排序的插入操作，保证高优先级的消息总是在链表的前端。
-4. **更新队列状态**：
+1. **Message preallocation**: Before entering the critical section, the system first calls `nxmq_alloc_msg()` to apply for an `mqueue_msg_s` structure from the global memory pool and uses `memcpy` to fill in the user data and priority. This preprocessing reduces work in the critical section and improves efficiency.
+2. **Enter critical section**: Call `enter_critical_section()` to ensure that modifications to the queue state are atomic.
+3. **Insert message**: Call `nxmq_add_queue()`, which inserts the message into the correct position in the `msgq->msglist` linked list based on the message's priority. This is a priority-sorted insertion operation to ensure that higher-priority messages are always at the front of the list.
+4. **Update queue status**:
+    - Increment the queue's current message count `nmsgs` by one.
+    - **Wake up receivers**: If the queue was empty before (`nmsgs` changed from 0 to 1), it means there may be tasks blocked on `mq_receive` due to an empty queue. At this point, `nxmq_notify_send()` needs to be called to wake up these waiting receiver tasks.
 
-    - 将队列的当前消息数 `nmsgs` 加一。
-    - **唤醒接收者**：如果在此之前队列是空的 (`nmsgs` 从 0 变为 1)，说明可能有任务因队列空而阻塞在 `mq_receive`。此时需要调用 `nxmq_notify_send()` 来唤醒这些等待的接收任务。
+5. Exit critical section: `leave_critical_section()`.
+6. Successful return.
 
-5. 退出临界区：`leave_critical_section()`。
-6. 成功返回。
+##### Scenario B: Queue is Full
 
-##### 场景 B: 队列已满
+1. **Check non-blocking condition**: When `msgq->nmsgs >= msgq->maxmsgs`, the system first determines whether blocking is allowed:
+    - Interrupt context: If currently in an interrupt (`up_interrupt_context()`), blocking is never allowed, and `-EAGAIN` is returned immediately.
+    - Non-blocking mode: If the queue is opened with the `O_NONBLOCK` flag, `-EAGAIN` is also returned immediately.
 
-1. **检查非阻塞条件**：当 `msgq->nmsgs >= msgq->maxmsgs` 时，系统首先会判断是否允许阻塞：
+2. **Transition to waiting**: If blocking is allowed, call the `nxmq_wait_send()` function, and the task will sleep here waiting for available space in the queue.
+3. **Wait for return**:
+   1. If `nxmq_wait_send` returns successfully (i.e., the task is woken up and space is available in the queue), the process returns to step 3 of **Scenario A** to insert the preallocated message into the queue.
+   2. If it fails due to timeout or signal interruption, call `nxmq_free_msg()` to release the previously preallocated message body and return an error code to the upper layer.
 
-    - 中断上下文：如果当前在中断中 (`up_interrupt_context()`)，绝不允许阻塞，立即返回 `-EAGAIN`。
-    - 非阻塞模式：如果队列以 `O_NONBLOCK` 标志打开，也立即返回 `-EAGAIN`。
+Key code is as follows:
 
-2. **转入等待**：如果允许阻塞，则调用 `nxmq_wait_send()` 函数，任务将在此处睡眠，等待队列出现可用空间。
-3. **等待返回**：
-   1. 如果 `nxmq_wait_send` 成功返回（即任务被唤醒且队列有空间了），则流程回到**场景 A** 的第 **3** 步，将预分配好的消息插入队列。
-   2. 如果因超时或信号中断而失败，则调用 `nxmq_free_msg()` 释放之前预分配的消息体，并向上层返回错误码。
-
-关键代码如下： 
-
-```C
+```c
 /****************************************************************************
  * Name: file_mq_timedsend_internal
  *
@@ -827,13 +823,13 @@ out:
 }
 ```
 
-`nxmq_wait_send`: 等待队列空间
+`nxmq_wait_send`: Waiting for Queue Space
 
-`nxmq_wait_send` 的功能与 `nxmq_wait_receive` 相互呼应，它负责在队列满时阻塞发送任务。其机制与调度器紧密配合，确保了资源的有效利用。
+`nxmq_wait_send` functions in concert with `nxmq_wait_receive`, responsible for blocking sending tasks when the queue is full. Its mechanism is closely integrated with the scheduler to ensure efficient resource utilization.
 
-其核心阻塞逻辑与 `nxmq_wait_receive` 非常相似，区别在于等待的条件和使用的列表不同。
+Its core blocking logic is very similar to `nxmq_wait_receive`, with the difference being the waiting conditions and the lists used.
 
-```C
+```c
 /****************************************************************************
  * Name: nxmq_wait_send
  
@@ -953,44 +949,44 @@ int nxmq_wait_send(FAR struct mqueue_inode_s *msgq, int oflags)
 }
 ```
 
-### `mq_receive`: 消息的接收与等待
+### `mq_receive`: Message Reception and Waiting
 
-`mq_receive()` 接口是消息发送的逆向操作，负责从队列中安全地取出消息。其核心任务包括：
+The `mq_receive()` interface is the reverse operation of message sending, responsible for safely retrieving messages from the queue. Its core tasks include:
 
-- **参数验证**：调用 `nxmq_verify_receive()` 对传入的缓冲区、长度等参数进行有效性检查。
-- **消息获取**：尝试从消息队列中获取消息。
-- **阻塞处理**：当队列为空时，根据队列属性（是否为 `O_NONBLOCK`）决定是立即返回错误，还是调用 `nxmq_wait_receive()` 阻塞当前任务直至新消息到达或超时。
-- **数据拷贝与资源释放**：成功获取消息后，将其内容拷贝到用户缓冲区，并调用 `nxmq_free_msg()` 释放消息结构体。
-- **唤醒发送者**：当接收操作使得一个满队列变为空闲时，通过 `nxmq_notify_receive()` 唤醒因队列满而阻塞的发送任务。
+- **Parameter validation**: Call `nxmq_verify_receive()` to validate the incoming buffer, length, and other parameters.
+- **Message acquisition**: Attempt to obtain a message from the message queue.
+- **Blocking handling**: When the queue is empty, decide whether to immediately return an error or call `nxmq_wait_receive()` to block the current task until a new message arrives or a timeout occurs, based on the queue attributes (whether it is `O_NONBLOCK`).
+- **Data copying and resource release**: After successfully acquiring a message, copy its content to the user buffer and call `nxmq_free_msg()` to release the message structure.
+- **Wake up senders**: When the receive operation changes a full queue to idle, wake up sending tasks blocked due to a full queue via `nxmq_notify_receive()`.
 
-其内部实现 `file_mq_timedreceive_internal` 的执行流程可分为两大场景：
+The execution flow of its internal implementation `file_mq_timedreceive_internal` can be divided into two scenarios:
 
-##### 场景 A: 队列非空 
+##### Scenario A: Queue is Not Empty
 
-1. **进入临界区**：调用 `enter_critical_section()` 锁住调度器，保证后续操作的原子性。
-2. **摘取消息**：直接从消息链表 `msgq->msglist` 的头部移除一个消息节点 (`list_remove_head`)。由于 `mq_send` 是按优先级插入的，这里取出的总是队列中存在时间最长且优先级最高的消息。
-3. 更新队列状态并唤醒发送者：
-    - 成功获取消息后，将队列的当前消息数 `nmsgs` 减一。
-    - 关键唤醒：检查 `nmsgs` 在减一之前是否等于 `maxmsgs` (`if (msgq->nmsgs-- == msgq->maxmsgs)`）。如果是，说明队列刚刚从满状态变为了非满，此时必须唤醒可能正在等待的发送任务。
-    - 调用 `nxmq_notify_receive()`，它会从 `waitfornotfull` 列表中找到一个（或多个）等待的发送任务，并将其移回就绪队列。
-    - 同时，通过 `nxmq_pollnotify(msgq, POLLOUT)` 发出 `POLLOUT` 事件，通知 `poll/select` 监视者该队列已可写入。
-4. 退出临界区：调用 `leave_critical_section()` 恢复调度。
-5. 数据返回与资源回收：
-    - 使用 `memcpy` 将消息节点中的数据拷贝到用户提供的缓冲区。
-    - 调用 `nxmq_free_msg()` 将消息节点归还给全局内存池。
+1. **Enter critical section**: Call `enter_critical_section()` to lock the scheduler and ensure the atomicity of subsequent operations.
+2. **Extract message**: Directly remove a message node from the head of the message linked list `msgq->msglist` (`list_remove_head`). Since `mq_send` inserts messages by priority, what is taken out here is always the longest-waiting and highest-priority message in the queue.
+3. Update queue status and wake up senders:
+    - After successfully acquiring the message, decrement the queue's current message count `nmsgs` by one.
+    - Key wake-up: Check if `nmsgs` was equal to `maxmsgs` before decrementing (`if (msgq->nmsgs-- == msgq->maxmsgs)`). If so, it means the queue has just changed from a full state to a non-full state, and sending tasks that may be waiting must be woken up at this point.
+    - Call `nxmq_notify_receive()`, which finds one (or more) waiting sending tasks from the `waitfornotfull` list and moves them back to the ready queue.
+    - Simultaneously, issue a `POLLOUT` event via `nxmq_pollnotify(msgq, POLLOUT)` to notify `poll/select` watchers that the queue is now writable.
+4. Exit critical section: Call `leave_critical_section()` to resume scheduling.
+5. Data return and resource recovery:
+    - Use `memcpy` to copy the data in the message node to the user-provided buffer.
+    - Call `nxmq_free_msg()` to return the message node to the global memory pool.
 
-##### 场景 B: 队列为空
+##### Scenario B: Queue is Empty
 
-1. 检查非阻塞标志：如果队列为空 (`mqmsg == NULL`)，首先检查 `mq_open` 时是否设置了 `O_NONBLOCK` 标志。
-    - 如果设置了，则立即退出临界区并返回 `-EAGAIN` 错误。
-2. 转入等待：若允许阻塞，则调用 `nxmq_wait_receive()` 函数，任务将在此处睡眠。
-3. 等待返回：`nxmq_wait_receive` 返回后：
-    - 如果成功获取到消息（`ret` 为 `OK`，`mqmsg` 指向新消息），则流程回到**场景 A**的第 **3** 步继续执行。
-    - 如果因超时或信号中断而失败（`ret` 为负值），则直接退出临界区并返回相应的错误码。
+1. Check the non-blocking flag: If the queue is empty (`mqmsg == NULL`), first check whether the `O_NONBLOCK` flag was set when `mq_open` was called.
+    - If set, immediately exit the critical section and return the `-EAGAIN` error.
+2. Transition to waiting: If blocking is allowed, call the `nxmq_wait_receive()` function, and the task will sleep here.
+3. Wait for return: After `nxmq_wait_receive` returns:
+    - If a message is successfully acquired (`ret` is `OK`, and `mqmsg` points to the new message), the process returns to step 3 of **Scenario A** to continue execution.
+    - If it fails due to timeout or signal interruption (`ret` is negative), directly exit the critical section and return the corresponding error code.
 
-关键代码如下：
+Key code is as follows:
 
-```C
+```c
 /****************************************************************************
  * Name: file_mq_timedreceive_internal
  *
@@ -1120,11 +1116,11 @@ ssize_t file_mq_timedreceive_internal(FAR struct file *mq, FAR char *msg,
 }
 ```
 
-`nxmq_wait_receive`: 任务的阻塞与唤醒
+`nxmq_wait_receive`: Task Blocking and Wake-Up
 
-`nxmq_wait_receive` 是接收机制中与调度器交互的核心，它精确地控制任务的阻塞与唤醒。
+`nxmq_wait_receive` is the core of the receive mechanism's interaction with the scheduler, precisely controlling task blocking and wake-up.
 
-```C
+```c
 /****************************************************************************
  * Name: nxmq_wait_receive
  *
@@ -1237,16 +1233,16 @@ int nxmq_wait_receive(FAR struct mqueue_inode_s *msgq,
 }
 ```
 
-其阻塞与唤醒流程与 `nxmq_wait_send` 形成了完美的对称：
+Its blocking and wake-up process forms a perfect symmetry with `nxmq_wait_send`:
 
-- 阻塞：任务将自己设置为 `TSTATE_WAIT_MQNOTEMPTY` 状态，并挂入 `waitfornotempty` 链表后，进入休眠。
-- 唤醒：当 `mq_send` 成功向一个空队列投递消息时，它会从 `waitfornotempty` 链表中取出等待的接收任务，并将其重新放入调度器的就绪列表，从而完成唤醒。
+- Blocking: The task sets itself to the `TSTATE_WAIT_MQNOTEMPTY` state, hangs itself into the `waitfornotempty` linked list, and then goes to sleep.
+- Wake-up: When `mq_send` successfully delivers a message to an empty queue, it retrieves the waiting receiver task from the `waitfornotempty` linked list and puts it back into the scheduler's ready list, completing the wake-up.
 
-### `mq_close`: 关闭消息队列
+### `mq_close`: Close a Message Queue
 
-`mq_close()` 用于关闭一个已经打开的消息队列描述符，释放与该任务相关的资源。
+`mq_close()` is used to close an opened message queue descriptor and release resources related to the task.
 
-```C
+```c
 /****************************************************************************
  * Name: mq_close
  *
@@ -1281,24 +1277,24 @@ int mq_close(mqd_t mqdes)
 }
 ```
 
-### `mq_unlink`: 销毁消息队列
+### `mq_unlink`: Destroy a Message Queue
 
-`mq_unlink()` 的作用是从系统中移除并销毁一个消息队列。这与 `mq_close()` 有本质区别：`mq_close()` 只是关闭一个任务对队列的**连接**（文件描述符），而 `mq_unlink()` 旨在彻底删除队列本身。
+The role of `mq_unlink()` is to remove and destroy a message queue from the system. This is fundamentally different from `mq_close()`: `mq_close()` only closes a task's **connection** (file descriptor) to the queue, while `mq_unlink()` aims to delete the queue itself completely.
 
-其实现依赖于 VFS（虚拟文件系统）的 `inode` 引用计数机制，以确保只有在没有任何任务使用该队列时，才会真正释放其资源。这是一种优雅的延迟销毁（Deferred Deletion）机制。
+Its implementation relies on the VFS (Virtual File System) `inode` reference count mechanism to ensure that resources are only released when no tasks are using the queue. This is an elegant deferred deletion mechanism.
 
-其核心逻辑由 `file_mq_unlink` 实现，流程如下：
+Its core logic is implemented by `file_mq_unlink`, and the process is as follows:
 
-1. **查找 Inode**：根据传入的队列名，在 VFS 的 `mqueue` 挂载点（如 `/dev/mqueue/`）下查找对应的 `inode`。`inode` 是文件系统用于描述一个文件或设备的核心数据结构，在这里它代表了整个消息队列。
-2. **移除命名**：调用 `inode_remove()` 将该 `inode` 从 VFS 的目录树中移除。这意味着此后无法再通过名字 `mq_open` 这个队列。
-    - 关键点：如果此时仍有任务打开着该队列（即 `inode` 的引用计数 `i_crefs` > 1），`inode_remove()` 会成功地将名字解绑，但返回 `-EBUSY`，表示 `inode` 本身因被引用而无法立即删除。这是一个符合预期的行为。
-3. **释放引用与触发销毁**：最后调用 `mq_inode_release()`，这是真正决定是否销毁队列的地方。
+1. **Find Inode**: Based on the incoming queue name, find the corresponding `inode` in the VFS's `mqueue` mount point (e.g., `/dev/mqueue/`). The `inode` is the core data structure used by the file system to describe a file or device, representing the entire message queue here.
+2. **Remove Naming**: Call `inode_remove()` to remove the `inode` from the VFS directory tree. This means the queue can no longer be `mq_open`ed by name.
+    - Key point: If tasks still have the queue open at this time (i.e., the `inode` reference count `i_crefs` > 1), `inode_remove()` will successfully unbind the name but return `-EBUSY`, indicating that the `inode` itself cannot be deleted immediately due to being referenced. This is an expected behavior.
+3. **Release References and Trigger Destruction**: Finally, call `mq_inode_release()`, which is where the decision to destroy the queue is truly made.
 
-总结：`mq_unlink` 标记一个消息队列为**待删除**。系统通过 `inode` 的引用计数来追踪其使用状态。当最后一个使用该队列的任务调用 `mq_close` 后，引用计数减为 1，此时 `mq_inode_release` 中的条件满足，触发 `nxmq_free_msgq` 执行最终的资源回收，包括队列中所有未读的消息。
+Summary: `mq_unlink` marks a message queue as **to be deleted**. The system tracks its usage status through the `inode` reference count. When the last task using the queue calls `mq_close`, the reference count decrements to 1, at which point the condition in `mq_inode_release` is met, triggering `nxmq_free_msgq` to perform final resource recovery, including all unread messages in the queue.
 
-主要代码如下： 
+Main code is as follows:
 
-```C
+```c
 /****************************************************************************
  * Name: file_mq_unlink
  *
@@ -1440,26 +1436,26 @@ static void mq_inode_release(FAR struct inode *inode)
 }
 ```
 
-### `mq_timedsend` / `mq_timedreceive`: 超时机制
+### `mq_timedsend` / `mq_timedreceive`: Timeout Mechanism
 
-这两个带 `timed` 后缀的接口，其主体逻辑与 `mq_send` / `mq_receive` 完全相同，唯一的区别在于增加了**超时等待**的功能。这个功能是通过内核的 看门狗定时器 (Watchdog Timer) 实现的。
+These two interfaces with the `timed` suffix have exactly the same main logic as `mq_send` / `mq_receive`, with the only difference being the addition of a **timeout waiting** function. This function is implemented through the kernel's watchdog timer.
 
-工作原理：
+Working principle:
 
-1. 启动定时器：当一个任务调用 `mq_timedsend` 或 `mq_timedreceive` 并因队列满/空而需要阻塞时，在它进入休眠（调用 `up_switch_context`）之前，会为自己启动一个一次性的看门狗定时器。
-    - `wd_start()` 会将一个 `watchdog` 结构体添加到系统的定时器链表中，并注册一个超时回调函数。
-    - 对于接收超时，回调函数是 `nxmq_rcvtimeout`；对于发送超时，回调函数是 `nxmq_sndtimeout`。
-2. **任务阻塞**：任务照常进入休眠，等待被唤醒。
-3. **两种唤醒路径**：
-    - 正常唤醒：在定时器到期前，队列状态发生改变（如收到新消息），另一个任务将该阻塞任务正常唤醒。被唤醒后，任务会做的第一件事就是调用 `wd_cancel()` 取消之前设置的看门狗定时器，然后正常收发消息。
-    - 超时唤醒：如果在指定时间内没有被正常唤醒，系统定时器中断在扫描 `watchdog` 链表时，会发现该任务的定时器已到期。
-        - 系统会执行预设的回调函数 (`nxmq_rcvtimeout` 或 `nxmq_sndtimeout`)。
-        - 这些回调函数都只做一件事：调用 `nxmq_wait_irq()`。
-4. **`nxmq_wait_irq`**：中断上下文中的唤醒处理器 此函数专门用于在中断上下文（如定时器中断）中，安全地唤醒一个因等待 IPC 而阻塞的任务。
+1. Start the timer: When a task calls `mq_timedsend` or `mq_timedreceive` and needs to block due to a full/empty queue, before it goes to sleep (calls `up_switch_context`), it starts a one-time watchdog timer for itself.
+    - `wd_start()` adds a `watchdog` structure to the system's timer linked list and registers a timeout callback function.
+    - For receive timeouts, the callback function is `nxmq_rcvtimeout`; for send timeouts, the callback function is `nxmq_sndtimeout`.
+2. **Task blocking**: The task normally goes to sleep, waiting to be woken up.
+3. **Two wake-up paths**:
+    - Normal wake-up: Before the timer expires, the queue status changes (e.g., a new message is received), and another task normally wakes up the blocked task. After being woken up, the first thing the task does is call `wd_cancel()` to cancel the previously set watchdog timer, then sends and receives messages normally.
+    - Timeout wake-up: If the task is not normally woken up within the specified time, when the system timer interrupt scans the `watchdog` linked list, it will find that the task's timer has expired.
+        - The system will execute the preset callback function (`nxmq_rcvtimeout` or `nxmq_sndtimeout`).
+        - These callback functions only do one thing: call `nxmq_wait_irq()`.
+4. **`nxmq_wait_irq`**: Wake-up processor in interrupt context This function is specifically used to safely wake up a task blocked due to waiting for IPC in an interrupt context (such as a timer interrupt).
 
-代码如下：
+Code is as follows:
 
-```C
+```c
 /****************************************************************************
  * Name: nxmq_wait_irq
  *
