@@ -1,11 +1,8 @@
 # Work Queue
 
-\[ English | [简体中文](../../../../zh-cn/device_dev_guide/kernel/IPC/work_queue.md) \]
-
-
 ## I. Overview
 
-The openvela operating system provides a Work Queue mechanism to defer tasks (Work) for execution in a dedicated worker thread context. The core advantages of this mechanism are **deferred execution** and **serial execution** of tasks. The system places pending tasks into a first-in-first-out (FIFO) queue, where they are retrieved and executed in order by threads from the worker thread pool.
+The openvela operating system provides a Work Queue mechanism to defer tasks (Work) for execution in a dedicated worker thread context. The core advantage of this mechanism are **deferred execution** and **serial execution** of tasks. The system places pending tasks into a first-in-first-out (FIFO) queue, where they are retrieved and executed in order by threads from the worker thread pool.
 
 openvela offers three different types of work queues to meet various scenario requirements:
 
@@ -289,7 +286,7 @@ Tasks can be added to a specified work queue through the `work_queue()` function
  *   worker - The worker callback to be invoked.  The callback will be
  *            invoked on the worker thread of execution.
  *   arg    - The argument that will be passed to the worker callback when
- *            it is invoked.
+ *            int is invoked.
  *   delay  - Delay (in clock ticks) from the time queue until the worker
  *            is invoked. Zero means to perform the work immediately.
  *
@@ -576,7 +573,7 @@ To maintain queue order, the implementation of `work_qqueue()` is more complex t
  *   worker - The worker callback to be invoked.  The callback will be
  *            invoked on the worker thread of execution.
  *   arg    - The argument that will be passed to the worker callback when
- *            it is invoked.
+ *            int is invoked.
  *   delay  - Delay (in clock ticks) from the time queue until the worker
  *            is invoked. Zero means to perform the work immediately.
  *
